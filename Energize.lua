@@ -1,9 +1,4 @@
---[[
-	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
-]]
---[[
-	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
-]]
+
 local Energize = Instance.new("ScreenGui")
 local MainFrame = Instance.new("Frame")
 local GuiBottomFrame = Instance.new("Frame")
