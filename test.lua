@@ -1,21 +1,81 @@
+--[[
+	Ella's Decompiler
+	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
+]]
 
-local scanDelay = 0.05
-local decompileTimeout = 1
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Config
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local SCAN_DELAY        = 0.05   -- pause between each script to avoid hitching
+local DECOMPILE_TIMEOUT = 1      -- seconds to wait for a single decompile() call
+local MAX_ROUNDS        = 5      -- safety re-scan passes for late-streamed scripts
+local CLIPBOARD_LIMIT   = 500 * 1024 -- ~500KB cap - large payloads can crash the client
+local BRAND             = "Ella's Decompiler"
 
 local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
+local Players     = game:GetService("Players")
+
+local getgenv = getgenv or function() return _G end
+local env = getgenv()
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Small helpers
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local function sanitize(name)
+	return string.gsub(tostring(name), '[<>:"/\\|?*%c]', "_"):sub(1, 50)
+end
+
+local function isCoreScript(scr)
+	local ok, isDescendant = pcall(function()
+		return scr:IsDescendantOf(game:GetService("CoreGui"))
+			or scr:IsDescendantOf(game:GetService("CorePackages"))
+	end)
+	return ok and isDescendant
+end
+
+local function makeGui()
+	local gui = Instance.new("ScreenGui")
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 2e9
+	local ok = pcall(function()
+		local getHiddenUi = env.gethui or function() return game:GetService("CoreGui") end
+		gui.Parent = getHiddenUi()
+	end)
+	if not ok then
+		pcall(function() gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui") end)
+	end
+	return gui
+end
+
+-- Isolated, crash-resistant clipboard write. Runs off the main call stack and
+-- never lets a bad setclipboard implementation take anything else down with it.
+local function copyToClipboardSafe(text, onDone)
+	task.spawn(function()
+		local fn = env.setclipboard or setclipboard or env.toclipboard
+			or (env.Clipboard and env.Clipboard.set)
+			or (syn and syn.write_clipboard)
+		if not fn then
+			onDone(false, "no clipboard function available")
+			return
+		end
+		local ok, err = pcall(fn, text)
+		onDone(ok, err)
+	end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Identify the game + decompiler availability
+-- ═══════════════════════════════════════════════════════════════════════════
 
 local gameName = "UnknownGame"
 pcall(function()
 	gameName = game:GetService("MarketplaceService"):GetProductInfoAsync(game.PlaceId).Name
 end)
 
-local function sanitize(name)
-	return string.gsub(tostring(name), '[<>:"/\\|?*%c]', "_"):sub(1, 50)
-end
-
-local FOLDER_NAME = "decompile_" .. sanitize(gameName) .. "_" .. tostring(game.PlaceId) .. "_" .. HttpService:GenerateGUID(false):sub(1, 6)
-local BRAND = "Ximmy's Sexy Script Decompiler"
+local FOLDER_NAME = "decompile_" .. sanitize(gameName) .. "_" .. tostring(game.PlaceId)
+	.. "_" .. HttpService:GenerateGUID(false):sub(1, 6)
 
 local hasDecompiler = false
 pcall(function()
@@ -28,40 +88,9 @@ pcall(function()
 	end
 end)
 
-local getgenv = getgenv or function() return _G end
-local env = getgenv()
-
--- clipboard helper: tries every known executor variant, returns true/false
-local function copyToClipboard(text)
-	local fn = env.setclipboard or setclipboard or env.toclipboard
-		or (env.Clipboard and env.Clipboard.set)
-		or (syn and syn.write_clipboard)
-	if not fn then return false end
-	local ok = pcall(fn, text)
-	return ok
-end
-
-local function makeGui()
-	local gui = Instance.new("ScreenGui")
-	gui.ResetOnSpawn = false
-	gui.DisplayOrder = 2e9
-	local ok = false
-	pcall(function()
-		local f = env.gethui or function() return game:GetService("CoreGui") end
-		gui.Parent = f()
-		ok = true
-	end)
-	if not ok then
-		pcall(function()
-			gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
-		end)
-	end
-	return gui
-end
-
 if not hasDecompiler then
 	local errGui = makeGui()
-	errGui.Name = "DecompilerError"
+	errGui.Name = "EllaDecompilerError"
 	local f = Instance.new("Frame")
 	f.Size = UDim2.new(0.45, 0, 0, 80)
 	f.Position = UDim2.new(0.275, 0, 0, 10)
@@ -75,7 +104,6 @@ if not hasDecompiler then
 	p.PaddingTop = UDim.new(0, 10)
 	local t = Instance.new("TextLabel", f)
 	t.Size = UDim2.new(1, 0, 0, 22)
-	t.Position = UDim2.new(0, 0, 0, 0)
 	t.BackgroundTransparency = 1
 	t.TextColor3 = Color3.fromRGB(255, 80, 80)
 	t.TextScaled = true
@@ -97,21 +125,24 @@ if not hasDecompiler then
 	return
 end
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Decompile + file writing
+-- ═══════════════════════════════════════════════════════════════════════════
+
 local function safeDecompile(scr)
-	local output = "-- Failed or empty output"
-	local finished = false
+	local output, finished = "-- Failed or empty output", false
 	task.spawn(function()
 		local ok, result = pcall(decompile, scr)
 		output = (ok and result and result ~= "") and result or "-- Failed or empty output"
 		finished = true
 	end)
 	local waited = 0
-	while not finished and waited < decompileTimeout do
+	while not finished and waited < DECOMPILE_TIMEOUT do
 		task.wait(0.1)
-		waited = waited + 0.1
+		waited += 0.1
 	end
 	if not finished then
-		output = "-- Timed out after " .. decompileTimeout .. "s"
+		output = "-- Timed out after " .. DECOMPILE_TIMEOUT .. "s"
 	end
 	return output
 end
@@ -119,7 +150,6 @@ end
 local createdDirs = {}
 local function ensureDir(path)
 	if createdDirs[path] then return end
-	createdDirs[path] = true
 	local current = ""
 	for part in string.gmatch(path, "[^/]+") do
 		current = current == "" and part or (current .. "/" .. part)
@@ -128,6 +158,7 @@ local function ensureDir(path)
 			pcall(env.makefolder or makefolder, current)
 		end
 	end
+	createdDirs[path] = true
 end
 
 local function buildScriptData(scr)
@@ -142,14 +173,7 @@ local function buildScriptData(scr)
 		or ".server.lua"
 	local dir = FOLDER_NAME .. "/" .. table.concat(parts, "/")
 	local path = dir .. "/" .. sanitize(scr.Name) .. ext
-	return { scr = scr, dir = dir, path = path }
-end
-
-local function isCoreScript(scr)
-	local success, isDescendant = pcall(function()
-		return scr:IsDescendantOf(game:GetService("CoreGui")) or scr:IsDescendantOf(game:GetService("CorePackages"))
-	end)
-	return success and isDescendant
+	return { dir = dir, path = path }
 end
 
 local function collectAllScripts()
@@ -162,12 +186,16 @@ local function collectAllScripts()
 	return found
 end
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- GUI
+-- ═══════════════════════════════════════════════════════════════════════════
+
 local screenGui = makeGui()
-screenGui.Name = "DecompilerGui"
+screenGui.Name = "EllaDecompilerGui"
+
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0.5, 0, 0, 165)
+frame.Size = UDim2.new(0.5, 0, 0, 182)
 frame.Position = UDim2.new(0.25, 0, 0, 10)
-frame.AnchorPoint = Vector2.new(0, 0)
 frame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
 frame.BorderSizePixel = 0
 frame.Parent = screenGui
@@ -177,35 +205,22 @@ pad.PaddingLeft = UDim.new(0, 10)
 pad.PaddingRight = UDim.new(0, 10)
 pad.PaddingTop = UDim.new(0, 8)
 
-local titleLabel = Instance.new("TextLabel", frame)
-titleLabel.Size = UDim2.new(1, 0, 0, 20)
-titleLabel.Position = UDim2.new(0, 0, 0, 0)
-titleLabel.BackgroundTransparency = 1
-titleLabel.TextColor3 = Color3.fromRGB(255, 200, 50)
-titleLabel.TextScaled = true
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = BRAND .. " - " .. gameName
+local function makeLabel(y, h, color, font, text)
+	local l = Instance.new("TextLabel", frame)
+	l.Size = UDim2.new(1, 0, 0, h)
+	l.Position = UDim2.new(0, 0, 0, y)
+	l.BackgroundTransparency = 1
+	l.TextColor3 = color
+	l.TextScaled = true
+	l.Font = font
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Text = text
+	return l
+end
 
-local statusLabel = Instance.new("TextLabel", frame)
-statusLabel.Size = UDim2.new(1, 0, 0, 18)
-statusLabel.Position = UDim2.new(0, 0, 0, 24)
-statusLabel.BackgroundTransparency = 1
-statusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-statusLabel.TextScaled = true
-statusLabel.Font = Enum.Font.Gotham
-statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "Scanning..."
-
-local scriptLabel = Instance.new("TextLabel", frame)
-scriptLabel.Size = UDim2.new(1, 0, 0, 16)
-scriptLabel.Position = UDim2.new(0, 0, 0, 46)
-scriptLabel.BackgroundTransparency = 1
-scriptLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-scriptLabel.TextScaled = true
-scriptLabel.Font = Enum.Font.Code
-scriptLabel.TextXAlignment = Enum.TextXAlignment.Left
-scriptLabel.Text = ""
+local titleLabel    = makeLabel(0,   20, Color3.fromRGB(255, 200, 50),  Enum.Font.GothamBold, BRAND .. " - " .. gameName)
+local statusLabel   = makeLabel(24,  18, Color3.fromRGB(200, 200, 200), Enum.Font.Gotham,     "Scanning...")
+local scriptLabel   = makeLabel(46,  16, Color3.fromRGB(150, 150, 150), Enum.Font.Code,       "")
 
 local barBg = Instance.new("Frame", frame)
 barBg.Size = UDim2.new(1, 0, 0, 14)
@@ -220,53 +235,13 @@ barFill.BackgroundColor3 = Color3.fromRGB(255, 200, 50)
 barFill.BorderSizePixel = 0
 Instance.new("UICorner", barFill).CornerRadius = UDim.new(0, 4)
 
-local etaLabel = Instance.new("TextLabel", frame)
-etaLabel.Size = UDim2.new(1, 0, 0, 14)
-etaLabel.Position = UDim2.new(0, 0, 0, 87)
-etaLabel.BackgroundTransparency = 1
-etaLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
-etaLabel.TextScaled = true
-etaLabel.Font = Enum.Font.Gotham
-etaLabel.TextXAlignment = Enum.TextXAlignment.Left
-etaLabel.Text = ""
+local etaLabel       = makeLabel(87,  14, Color3.fromRGB(120, 120, 120), Enum.Font.Gotham,     "")
+local statsLabel     = makeLabel(105, 14, Color3.fromRGB(180, 180, 180), Enum.Font.GothamBold, "Passed: 0  |  Failed: 0")
+local savedLabel     = makeLabel(123, 14, Color3.fromRGB(80, 200, 255),  Enum.Font.Gotham,     "Folder: " .. FOLDER_NAME)
+local clipboardLabel = makeLabel(141, 14, Color3.fromRGB(150, 150, 150), Enum.Font.Gotham,     "")
 
-local statsLabel = Instance.new("TextLabel", frame)
-statsLabel.Size = UDim2.new(1, 0, 0, 14)
-statsLabel.Position = UDim2.new(0, 0, 0, 105)
-statsLabel.BackgroundTransparency = 1
-statsLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-statsLabel.TextScaled = true
-statsLabel.Font = Enum.Font.GothamBold
-statsLabel.TextXAlignment = Enum.TextXAlignment.Left
-statsLabel.Text = "Passed: 0  |  Failed: 0"
-
-local savedLabel = Instance.new("TextLabel", frame)
-savedLabel.Size = UDim2.new(1, 0, 0, 14)
-savedLabel.Position = UDim2.new(0, 0, 0, 123)
-savedLabel.BackgroundTransparency = 1
-savedLabel.TextColor3 = Color3.fromRGB(80, 200, 255)
-savedLabel.TextScaled = true
-savedLabel.Font = Enum.Font.Gotham
-savedLabel.TextXAlignment = Enum.TextXAlignment.Left
-savedLabel.Text = "Folder: " .. FOLDER_NAME
-
--- resize frame slightly to fit the new clipboard status line
-frame.Size = UDim2.new(0.5, 0, 0, 182)
-
-local clipboardLabel = Instance.new("TextLabel", frame)
-clipboardLabel.Size = UDim2.new(1, 0, 0, 14)
-clipboardLabel.Position = UDim2.new(0, 0, 0, 141)
-clipboardLabel.BackgroundTransparency = 1
-clipboardLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-clipboardLabel.TextScaled = true
-clipboardLabel.Font = Enum.Font.Gotham
-clipboardLabel.TextXAlignment = Enum.TextXAlignment.Left
-clipboardLabel.Text = ""
-
-local passedCount = 0
-local failedCount = 0
-local totalKnownScripts = 0
-local processedCount = 0 -- fixes the old "#processed" bug (processed is keyed by instance, not index)
+local passedCount, failedCount, totalKnownScripts = 0, 0, 0
+local fileCounter = 0 -- real running counter, replaces the old buggy #processed fallback
 
 local function updateStats()
 	statsLabel.Text = string.format("Passed: %d  |  Failed: %d", passedCount, failedCount)
@@ -298,20 +273,22 @@ local function updateGui(scriptPath, elapsed, eta, finished)
 	end
 end
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Processing loop
+-- ═══════════════════════════════════════════════════════════════════════════
+
 local processed = {}
 
--- combined output buffer for the clipboard copy at the end
-local combinedChunks = {}
-local combinedSize = 0
-local COMBINED_LIMIT = 4 * 1024 * 1024 -- keep clipboard payload under ~4MB, most executors choke above this
+-- Small, hard-capped clipboard buffer. Kept intentionally tiny (500KB default)
+-- because building/holding one giant multi-MB string for setclipboard is what
+-- was likely crashing the client before.
+local clipboardChunks = {}
+local clipboardSize = 0
+local clipboardFull = false
 
 local function processScriptList(scriptList, startTime)
-	for i, scr in ipairs(scriptList) do
-		if scanDelay > 0 then
-			task.wait(scanDelay)
-		else
-			task.wait()
-		end
+	for _, scr in ipairs(scriptList) do
+		task.wait(SCAN_DELAY > 0 and SCAN_DELAY or nil)
 
 		if not processed[scr] then
 			processed[scr] = true
@@ -320,39 +297,41 @@ local function processScriptList(scriptList, startTime)
 			pcall(function() fullName = scr:GetFullName() end)
 
 			local ok, err = pcall(function()
-				if not scr or not scr.Parent then
-					error("destroyed")
-				end
+				if not scr or not scr.Parent then error("destroyed") end
 
 				local data = buildScriptData(scr)
 				local rawSource = safeDecompile(scr)
-				local header = "-- " .. BRAND .. "\n-- Original: " .. fullName .. "\n\n"
-				local source = header .. rawSource
+				local source = "-- " .. BRAND .. "\n-- Original: " .. fullName .. "\n\n" .. rawSource
 
 				ensureDir(data.dir)
 				local written = pcall(env.writefile or writefile, data.path, source)
 				if not written then
-					-- FIXED: was using #processed (a hash table, always 0-ish) for uniqueness.
-					-- Now uses a real running counter so fallback paths never collide.
-					processedCount = processedCount + 1
-					local flatPath = FOLDER_NAME .. "/" .. processedCount .. "_" .. sanitize(scr.Name) .. ".lua"
+					fileCounter += 1
+					local flatPath = FOLDER_NAME .. "/" .. fileCounter .. "_" .. sanitize(scr.Name) .. ".lua"
 					ensureDir(FOLDER_NAME)
 					pcall(env.writefile or writefile, flatPath, source)
 				end
 
-				-- append to the combined clipboard buffer, size-capped
-				if combinedSize < COMBINED_LIMIT then
-					local chunk = "\n" .. string.rep("=", 60) .. "\n-- " .. fullName .. "\n" .. string.rep("=", 60) .. "\n" .. rawSource .. "\n"
-					combinedSize = combinedSize + #chunk
-					table.insert(combinedChunks, chunk)
+				-- append to clipboard buffer only while under the cap, and only
+				-- for source that actually decompiled (skip empty/timeout noise)
+				if not clipboardFull and rawSource ~= "-- Failed or empty output"
+					and not rawSource:match("^%-%- Timed out") then
+					local chunk = "\n" .. string.rep("=", 50) .. "\n-- " .. fullName .. "\n"
+						.. string.rep("=", 50) .. "\n" .. rawSource .. "\n"
+					if clipboardSize + #chunk > CLIPBOARD_LIMIT then
+						clipboardFull = true
+					else
+						clipboardSize += #chunk
+						table.insert(clipboardChunks, chunk)
+					end
 				end
 			end)
 
 			if ok then
-				passedCount = passedCount + 1
+				passedCount += 1
 			else
-				failedCount = failedCount + 1
-				warn("[Decompiler] FAILED " .. fullName .. ": " .. tostring(err))
+				failedCount += 1
+				warn("[" .. BRAND .. "] FAILED " .. fullName .. ": " .. tostring(err))
 			end
 			updateStats()
 
@@ -368,14 +347,11 @@ end
 
 local startTime = os.clock()
 local round = 1
-local MAX_ROUNDS = 5
 
--- FIXED: instead of blindly re-scanning game:GetDescendants() every round
--- (slow on big games), listen for DescendantAdded once and merge late-streamed
--- scripts into the queue, while still doing a couple of safety re-scans.
+-- Listen for late-streamed scripts instead of repeatedly re-walking the whole
+-- game tree every round - cheaper than a full GetDescendants() rescan each pass.
 local lateArrivals = {}
-local descendantAddedConn
-descendantAddedConn = game.DescendantAdded:Connect(function(obj)
+local descendantAddedConn = game.DescendantAdded:Connect(function(obj)
 	if obj:IsA("LuaSourceContainer") and not processed[obj] and not isCoreScript(obj) then
 		table.insert(lateArrivals, obj)
 	end
@@ -385,48 +361,51 @@ repeat
 	local scripts = collectAllScripts()
 	local newScripts = {}
 	for _, scr in ipairs(scripts) do
-		if not processed[scr] then
-			table.insert(newScripts, scr)
-		end
+		if not processed[scr] then table.insert(newScripts, scr) end
 	end
 	for _, scr in ipairs(lateArrivals) do
-		if not processed[scr] then
-			table.insert(newScripts, scr)
-		end
+		if not processed[scr] then table.insert(newScripts, scr) end
 	end
 	lateArrivals = {}
 
-	if #newScripts == 0 then
-		break
-	end
+	if #newScripts == 0 then break end
 
-	totalKnownScripts = totalKnownScripts + #newScripts
+	totalKnownScripts += #newScripts
 	statusLabel.Text = string.format("Pass %d: %d new scripts found", round, #newScripts)
 	task.wait(0.5)
 	processScriptList(newScripts, startTime)
-	round = round + 1
+	round += 1
 until round > MAX_ROUNDS
 
-if descendantAddedConn then descendantAddedConn:Disconnect() end
+descendantAddedConn:Disconnect()
 
 local totalTime = math.floor(os.clock() - startTime)
 updateGui("All done!", totalTime, 0, true)
 
--- copy everything decompiled to clipboard
-local fullDump = "-- " .. BRAND .. "\n-- Game: " .. gameName .. " (" .. tostring(game.PlaceId) .. ")\n"
-	.. "-- Scripts: " .. passedCount .. " passed, " .. failedCount .. " failed\n"
-	.. table.concat(combinedChunks)
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Clipboard copy (isolated + size-capped, to avoid crashing the client)
+-- ═══════════════════════════════════════════════════════════════════════════
 
-local copied = copyToClipboard(fullDump)
-if copied then
-	clipboardLabel.TextColor3 = Color3.fromRGB(80, 255, 150)
-	clipboardLabel.Text = "📋 Copied " .. math.floor(#fullDump / 1024) .. " KB to clipboard!"
-else
-	clipboardLabel.TextColor3 = Color3.fromRGB(255, 120, 80)
-	clipboardLabel.Text = "⚠ Clipboard copy failed (payload too large or unsupported)"
-end
--- also stash it in a global as a manual fallback, same pattern as our other decompiler tools
-env._DECOMPILED_DUMP = fullDump
+clipboardLabel.Text = "Copying to clipboard..."
+clipboardLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
+
+local header = "-- " .. BRAND .. "\n-- Game: " .. gameName .. " (" .. tostring(game.PlaceId) .. ")\n"
+	.. "-- Scripts: " .. passedCount .. " passed, " .. failedCount .. " failed\n"
+local clipboardText = header .. table.concat(clipboardChunks)
+
+copyToClipboardSafe(clipboardText, function(ok, err)
+	if ok then
+		clipboardLabel.TextColor3 = Color3.fromRGB(80, 255, 150)
+		local sizeNote = clipboardFull and (" (capped at " .. math.floor(CLIPBOARD_LIMIT / 1024) .. "KB)") or ""
+		clipboardLabel.Text = "Copied " .. math.floor(#clipboardText / 1024) .. "KB to clipboard!" .. sizeNote
+	else
+		clipboardLabel.TextColor3 = Color3.fromRGB(255, 120, 80)
+		clipboardLabel.Text = "Clipboard copy failed: " .. tostring(err)
+	end
+end)
+
+-- manual fallback, same as before, in case setclipboard is flaky on your executor
+env._ELLA_DECOMPILE_DUMP = clipboardText
 
 task.wait(15)
 pcall(function() screenGui:Destroy() end)
