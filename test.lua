@@ -24,11 +24,11 @@ if not getgenv then getgenv = function() return getfenv(0) end end
 local SCRIPT_URL = ""
 local Rayfield
 local _rfSrc
-local _ok1, _res1 = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/kobidelrey/Rayfield-modded/main/source.lua") end)
+local _ok1, _res1 = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/sirius-menu/rayfield/refs/heads/main/source.lua") end)
 if _ok1 and _res1 and #_res1 > 500 then
 _rfSrc = _res1
 else
-local _ok2, _res2 = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/kobidelrey/Rayfield-modded/main/source.lua") end)
+local _ok2, _res2 = pcall(function() return game:HttpGet("https://sirius.menu/rayfield") end)
 if _ok2 and _res2 and #_res2 > 500 then
 _rfSrc = _res2
 end
